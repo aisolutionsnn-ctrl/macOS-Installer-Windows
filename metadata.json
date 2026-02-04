@@ -1,0 +1,5 @@
+{
+  "name": "HackinFlow",
+  "description": "Automated macOS Bootable USB creator for Hackintosh. Streamlines OpenCore configuration, drive formatting, and macOS downloading.",
+  "requestFramePermissions": []
+}
