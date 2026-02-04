@@ -16,14 +16,36 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      webSecurity: false, // Allow loading local resources
     },
   });
 
+  // Open DevTools in development
   if (isDev) {
+    mainWindow.webContents.openDevTools();
     mainWindow.loadURL('http://localhost:5173');
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    const indexPath = path.join(__dirname, '../dist/index.html');
+    console.log('Loading from:', indexPath);
+    
+    // Check if file exists before loading
+    if (fs.existsSync(indexPath)) {
+      mainWindow.loadFile(indexPath);
+    } else {
+      console.error('Built files not found at:', indexPath);
+      // Fallback to development server
+      mainWindow.loadURL('http://localhost:5173');
+    }
   }
+
+  // Log any page loading errors
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('Failed to load:', errorCode, errorDescription);
+  });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('Page loaded successfully');
+  });
 }
 
 app.whenReady().then(() => {
