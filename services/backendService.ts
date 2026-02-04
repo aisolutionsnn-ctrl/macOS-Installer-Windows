@@ -96,69 +96,146 @@ export const backend = {
     try {
       console.log(`[BACKEND] Fetching Apple Catalog for version: ${version}, build: ${build}...`);
       
-      // Koristimo allorigins kao alternativni proxy ako je fajl prevelik za corsproxy
-      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(APPLE_CATALOG_URL)}`;
-      const response = await fetch(proxyUrl);
+      // Try multiple proxy sources for reliability
+      const proxies = [
+        `https://api.allorigins.win/get?url=${encodeURIComponent(APPLE_CATALOG_URL)}`,
+        `https://corsproxy.io/?${encodeURIComponent(APPLE_CATALOG_URL)}`
+      ];
       
-      if (!response.ok) {
-        throw new Error(`Katalog nedostupan (Status: ${response.status})`);
+      let text = '';
+      let success = false;
+      
+      for (const proxyUrl of proxies) {
+        try {
+          console.log(`[BACKEND] Trying proxy: ${proxyUrl}`);
+          const response = await fetch(proxyUrl);
+          
+          if (!response.ok) {
+            console.warn(`[BACKEND] Proxy ${proxyUrl} failed with status: ${response.status}`);
+            continue;
+          }
+
+          if (proxyUrl.includes('allorigins')) {
+            const json = await response.json();
+            text = json.contents;
+          } else {
+            text = await response.text();
+          }
+          
+          if (text && text.length > 1000) {
+            success = true;
+            console.log(`[BACKEND] Successfully fetched catalog (${text.length} chars)`);
+            break;
+          }
+        } catch (err) {
+          console.warn(`[BACKEND] Proxy ${proxyUrl} error:`, err);
+          continue;
+        }
+      }
+      
+      if (!success) {
+        throw new Error("All proxies failed. Catalog unavailable.");
       }
 
-      const json = await response.json();
-      const text = json.contents;
+      // Improved parsing strategy - look for specific build numbers and version patterns
+      console.log(`[BACKEND] Parsing catalog for version ${version}, build ${build}...`);
       
-      if (!text || text.length < 1000) {
-        throw new Error("Katalog je prazan ili previše mali. Proxy greška.");
-      }
-
-      /**
-       * U Apple katalogu (plist), podaci su grupisani po proizvodima (Products).
-       * Svaki proizvod ima set paketa (Packages) i metapodatke (ExtendedMetaInfo).
-       * Tražimo blok koji sadrži verziju stringa.
-       */
+      // Find all InstallAssistant.pkg links
+      const pkgLinks = text.match(/https?:\/\/swcdn\.apple\.com\/content\/downloads\/.*?\/InstallAssistant.*?\.pkg/gi) || [];
+      const recoveryLinks = text.match(/https?:\/\/swcdn\.apple\.com\/content\/downloads\/.*?\/RecoveryHDMetaDmg.*?\.pkg/gi) || [];
       
-      // Razdvajamo tekst na blokove <dict> koji predstavljaju proizvode (približna metoda bez punog XML parsera)
-      const products = text.split('<key>Products</key>')[1]?.split('<key>')[1]?.split('</dict>');
+      console.log(`[BACKEND] Found ${pkgLinks.length} InstallAssistant links, ${recoveryLinks.length} Recovery links`);
       
-      // Pokušaj 1: Tražimo blok koji sadrži i verziju i InstallAssistant.pkg
-      const versionSafe = version.replace(/\./g, '\\.');
-      // Tražimo InstallAssistant.pkg link koji je "blizu" verzije u tekstu
-      // Delimo ceo katalog na delove oko svakog linka i proveravamo prisustvo verzije
-      const links = text.match(/https?:\/\/swcdn\.apple\.com\/content\/downloads\/.*?\/(?:InstallAssistant|RecoveryHDMetaDmg)\.pkg/gi) || [];
-      
-      console.log(`[BACKEND] Found ${links.length} total potential links. Filtering for ${version}...`);
-
-      // Filtriramo linkove
-      // gibMacOS princip: Proveri .dist fajl. Mi ćemo proveriti kontekst u katalogu.
-      for (const link of links) {
-        // Uzimamo isečak teksta oko linka (5000 karaktera pre) da vidimo metapodatke
+      // Strategy 1: Exact build match
+      for (const link of [...pkgLinks, ...recoveryLinks]) {
         const index = text.indexOf(link);
-        const context = text.substring(Math.max(0, index - 5000), index);
+        const contextStart = Math.max(0, index - 3000);
+        const contextEnd = Math.min(text.length, index + 1000);
+        const context = text.substring(contextStart, contextEnd);
         
-        if (context.includes(`<string>${version}</string>`) || context.includes(`>${version}<`)) {
-          console.log(`[BACKEND] Match found for ${version}: ${link}`);
+        // Look for build number in context
+        if (context.includes(build) || context.includes(`>${build}<`) || context.includes(`"${build}"`)) {
+          console.log(`[BACKEND] Found exact build match for ${build}: ${link}`);
           return link;
         }
       }
-
-      // Pokušaj 2: Ako nismo našli striktan meč sa verzijom, tražimo bilo koji Monterey build ako je Monterey u pitanju
-      if (version.startsWith("12.")) {
-         const montereyLinks = links.filter((l: string) => l.includes("InstallAssistant.pkg"));
-         // Monterey je često u sredini kataloga. Vraćamo najverovatniji ako postoji.
-         if (montereyLinks.length > 0) {
-            console.log(`[BACKEND] Fallback: Returning first Monterey-capable link.`);
-            return montereyLinks.find((l: string) => l.toLowerCase().includes("monterey")) || montereyLinks[0];
-         }
+      
+      // Strategy 2: Version match with better context checking
+      const versionPatterns = [
+        `<string>${version}</string>`,
+        `>${version}<`,
+        `"${version}"`,
+        `${version}.`,
+        `${version} `
+      ];
+      
+      for (const link of [...pkgLinks, ...recoveryLinks]) {
+        const index = text.indexOf(link);
+        const contextStart = Math.max(0, index - 5000);
+        const contextEnd = Math.min(text.length, index + 1000);
+        const context = text.substring(contextStart, contextEnd);
+        
+        for (const pattern of versionPatterns) {
+          if (context.includes(pattern)) {
+            console.log(`[BACKEND] Found version match for ${version}: ${link}`);
+            return link;
+          }
+        }
       }
-
-      // Pokušaj 3: Vrati bilo koji stabilan link za traženu vrstu (Full)
-      const assistantLinks = links.filter((l: string) => l.includes("InstallAssistant.pkg"));
-      if (assistantLinks.length > 0) {
-        const fallback = assistantLinks[assistantLinks.length - 1]; // Poslednji je obično najnoviji Sequoia/Sonoma
-        console.warn(`[BACKEND] Exact version match not found. Falling back to latest stable: ${fallback}`);
+      
+      // Strategy 3: Version-specific fallbacks
+      if (version.startsWith("15.")) { // Sequoia
+        const sequoiaLinks = pkgLinks.filter(link => 
+          link.toLowerCase().includes('sequoia') || 
+          link.toLowerCase().includes('15.')
+        );
+        if (sequoiaLinks.length > 0) {
+          console.log(`[BACKEND] Fallback: Using Sequoia link: ${sequoiaLinks[0]}`);
+          return sequoiaLinks[0];
+        }
+      }
+      
+      if (version.startsWith("14.")) { // Sonoma
+        const sonomaLinks = pkgLinks.filter(link => 
+          link.toLowerCase().includes('sonoma') || 
+          link.toLowerCase().includes('14.')
+        );
+        if (sonomaLinks.length > 0) {
+          console.log(`[BACKEND] Fallback: Using Sonoma link: ${sonomaLinks[0]}`);
+          return sonomaLinks[0];
+        }
+      }
+      
+      if (version.startsWith("13.")) { // Ventura
+        const venturaLinks = pkgLinks.filter(link => 
+          link.toLowerCase().includes('ventura') || 
+          link.toLowerCase().includes('13.')
+        );
+        if (venturaLinks.length > 0) {
+          console.log(`[BACKEND] Fallback: Using Ventura link: ${venturaLinks[0]}`);
+          return venturaLinks[0];
+        }
+      }
+      
+      if (version.startsWith("12.")) { // Monterey
+        const montereyLinks = pkgLinks.filter(link => 
+          link.toLowerCase().includes('monterey') || 
+          link.toLowerCase().includes('12.')
+        );
+        if (montereyLinks.length > 0) {
+          console.log(`[BACKEND] Fallback: Using Monterey link: ${montereyLinks[0]}`);
+          return montereyLinks[0];
+        }
+      }
+      
+      // Strategy 4: Return the most recent InstallAssistant
+      if (pkgLinks.length > 0) {
+        const fallback = pkgLinks[pkgLinks.length - 1];
+        console.warn(`[BACKEND] No exact match found. Using latest InstallAssistant: ${fallback}`);
         return fallback;
       }
-
+      
+      console.error(`[BACKEND] No valid download links found for ${version} (${build})`);
       return null;
     } catch (err) {
       console.error("Failed to fetch/parse Apple Catalog:", err);
